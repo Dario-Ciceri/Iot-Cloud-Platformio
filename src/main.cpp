@@ -1,7 +1,7 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
 #include <WiFiS3.h>
 #include <PubSubClient.h>
+#include <cbor.h>
 
 // ************************ CONFIGURAZIONE ************************
 const char WIFI_SSID[] = "test";
@@ -13,22 +13,24 @@ const char MQTT_CLIENT_ID[] = "arduino-uno-r4-wifi";
 const char MQTT_USER[] = "serverpod";
 const char MQTT_PASS[] = "serverpod";
 
-const char PUB_TOPIC[] = "arduino/loopback";
-const char SUB_TOPIC[] = "arduino/commands";
+const char PUB_TOPIC[] = "arduino-uno-r4-wifi/loopback";
+const char SUB_TOPIC[] = "arduino-uno-r4-wifi/commands";
 
 const int PUB_INTERVAL = 5000;
 const int CONNECTION_RETRY = 15000;
+const size_t CBOR_BUFFER_SIZE = 128;
 // ***************************************************************
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
+uint8_t cborBuffer[CBOR_BUFFER_SIZE];
 unsigned long lastPubTime = 0;
 unsigned long lastConnAttempt = 0;
 bool wifiConnected = false;
 bool mqttConnected = false;
 
-// Prototipi modificati per UNO R4
+// Prototipi
 bool initWiFi();
 bool initMQTT();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
@@ -39,17 +41,15 @@ int getFreeMemory();
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial); // Rimuovere questa linea in produzione
+  while (!Serial); // Rimuovere in produzione
   
   Serial.println("\n[SYSTEM] Avvio Arduino UNO R4 WiFi...");
   
   // Configurazione specifica per UNO R4
-  WiFi.setTimeout(10000); // Timeout aumentato per compatibilità
-  mqttClient.setBufferSize(256);
-  mqttClient.setKeepAlive(30);
+  WiFi.setTimeout(10000);
+  mqttClient.setBufferSize(CBOR_BUFFER_SIZE);
   mqttClient.setCallback(mqttCallback);
   
-  // LED integrato
   pinMode(LED_BUILTIN, OUTPUT);
 }
 
@@ -71,14 +71,14 @@ void loop() {
   }
 
   safeDelay(100);
-  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Heartbeat LED
+  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 }
 
 // ******************** FUNZIONI WIFI/MQTT ***********************
 bool initWiFi() {
   Serial.println("\n[WiFi] Tentativo connessione...");
   
-  WiFi.end(); // Metodo corretto per reset su UNO R4
+  WiFi.end();
   delay(1000);
   
   int status = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -102,11 +102,7 @@ bool initMQTT() {
   
   Serial.println("\n[MQTT] Connessione al broker...");
   
-  if (mqttClient.connect(
-    MQTT_CLIENT_ID, 
-    MQTT_USER, 
-    MQTT_PASS
-  )) {
+  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
     Serial.println("[MQTT] Connesso!");
     mqttClient.subscribe(SUB_TOPIC);
     return true;
@@ -124,20 +120,40 @@ bool initMQTT() {
 }
 
 void publishData() {
-  StaticJsonDocument<128> doc; // Ridotto per UNO R4
-  doc["ts"] = millis();
-  doc["a0"] = analogRead(A0);
-  doc["mem"] = getFreeMemory();
+  CborError err;
+  CborEncoder encoder, mapEncoder;
+  
+  cbor_encoder_init(&encoder, cborBuffer, sizeof(cborBuffer), 0);
+  
+  // Crea mappa con 3 elementi
+  err = cbor_encoder_create_map(&encoder, &mapEncoder, 3);
+  if(err != CborNoError) {
+    Serial.println("Errore creazione mappa CBOR");
+    return;
+  }
 
-  char buffer[128];
-  size_t len = serializeJson(doc, buffer);
+  // Timestamp
+  cbor_encode_text_stringz(&mapEncoder, "ts");
+  cbor_encode_uint(&mapEncoder, millis());
 
-  if (mqttClient.publish(PUB_TOPIC, buffer, len)) {
-    Serial.print("[MQTT] Inviati ");
-    Serial.print(len);
+  // Valore analogico
+  cbor_encode_text_stringz(&mapEncoder, "a0");
+  cbor_encode_uint(&mapEncoder, analogRead(A0));
+
+  // Memoria libera
+  cbor_encode_text_stringz(&mapEncoder, "mem");
+  cbor_encode_uint(&mapEncoder, getFreeMemory());
+
+  cbor_encoder_close_container(&encoder, &mapEncoder);
+
+  size_t cborLen = cbor_encoder_get_buffer_size(&encoder, cborBuffer);
+  
+  if(mqttClient.publish(PUB_TOPIC, cborBuffer, cborLen)) {
+    Serial.print("[CBOR] Inviati ");
+    Serial.print(cborLen);
     Serial.println(" bytes");
   } else {
-    Serial.println("[MQTT] Errore trasmissione!");
+    Serial.println("[CBOR] Errore trasmissione!");
   }
 }
 
@@ -146,21 +162,37 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("\n[MQTT] Ricevuto: ");
   Serial.println(topic);
 
-  StaticJsonDocument<64> doc;
-  DeserializationError error = deserializeJson(doc, payload, length);
+  CborParser parser;
+  CborValue value;
+  CborError err = cbor_parser_init(payload, length, 0, &parser, &value);
   
-  if (error) {
-    Serial.print("[JSON] Errore: ");
-    Serial.println(error.c_str());
+  if(err || !cbor_value_is_map(&value)) {
+    Serial.println("CBOR non valido");
     return;
   }
 
-  // Esempio comando: {"led":1}
-  if (doc.containsKey("led")) {
-    int state = doc["led"];
-    digitalWrite(LED_BUILTIN, state);
-    Serial.print("[LED] Impostato a: ");
-    Serial.println(state);
+  CborValue mapItem;
+  size_t mapSize;
+  cbor_value_get_map_length(&value, &mapSize);
+  cbor_value_enter_container(&value, &mapItem);
+
+  for(size_t i = 0; i < mapSize; ++i) {
+    if(cbor_value_is_text_string(&mapItem)) {
+      char key[16];
+      size_t keyLen = sizeof(key);
+      cbor_value_copy_text_string(&mapItem, key, &keyLen, NULL);
+      
+      cbor_value_advance(&mapItem);
+      
+      if(strcmp(key, "led") == 0 && cbor_value_is_integer(&mapItem)) {
+        int state;
+        cbor_value_get_int(&mapItem, &state);
+        digitalWrite(LED_BUILTIN, state);
+        Serial.print("[LED] Impostato a: ");
+        Serial.println(state);
+      }
+      cbor_value_advance(&mapItem);
+    }
   }
 }
 
@@ -186,7 +218,6 @@ void safeDelay(unsigned long ms) {
 }
 
 int getFreeMemory() {
-  // Metodo affidabile per UNO R4
   char top;
   return &top - reinterpret_cast<char*>(malloc(1));
 }
