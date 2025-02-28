@@ -1,24 +1,40 @@
 #include <Arduino.h>
-#include <WiFiS3.h>
 #include <PubSubClient.h>
 #include <cbor.h>
 
-// ************************ CONFIGURAZIONE ************************
+// Platform-specific includes
+#ifdef ESP32
+  #include <WiFi.h>
+  #define LED_PIN 2
+#else // Arduino UNO R4 WiFi
+  #include <WiFiS3.h>
+  #define LED_PIN LED_BUILTIN
+#endif
+
+// *********************** CONFIGURAZIONE ************************
 const char WIFI_SSID[] = "test";
 const char WIFI_PASSWORD[] = "12345678";
 
 const char MQTT_BROKER[] = "192.168.1.243";
 const int MQTT_PORT = 1883;
-const char MQTT_CLIENT_ID[] = "arduino-uno-r4-wifi";
 const char MQTT_USER[] = "serverpod";
 const char MQTT_PASS[] = "serverpod";
 
-const char PUB_TOPIC[] = "arduino-uno-r4-wifi/loopback";
-const char SUB_TOPIC[] = "arduino-uno-r4-wifi/commands";
+// Platform-specific MQTT settings
+#ifdef ESP32
+  const char MQTT_CLIENT_ID[] = "esp32-device";
+  const char PUB_TOPIC[] = "esp32/loopback";
+  const char SUB_TOPIC[] = "esp32/commands";
+  const size_t CBOR_BUFFER_SIZE = 256;  // ESP32 ha più memoria
+#else
+  const char MQTT_CLIENT_ID[] = "arduino-uno-r4-wifi";
+  const char PUB_TOPIC[] = "arduino-uno-r4-wifi/loopback";
+  const char SUB_TOPIC[] = "arduino-uno-r4-wifi/commands";
+  const size_t CBOR_BUFFER_SIZE = 128;
+#endif
 
 const int PUB_INTERVAL = 5000;
 const int CONNECTION_RETRY = 15000;
-const size_t CBOR_BUFFER_SIZE = 128;
 // ***************************************************************
 
 WiFiClient wifiClient;
@@ -41,16 +57,30 @@ int getFreeMemory();
 
 void setup() {
   Serial.begin(115200);
+  
+  #ifndef ESP32
+  // Solo per UNO R4: wait for serial port to connect
   while (!Serial); // Rimuovere in produzione
+  #else
+  delay(1000); // ESP32: breve attesa senza bloccare
+  #endif
   
-  Serial.println("\n[SYSTEM] Avvio Arduino UNO R4 WiFi...");
+  Serial.print("\n[SYSTEM] Avvio ");
+  Serial.print(BOARD_NAME);
+  Serial.println("...");
   
-  // Configurazione specifica per UNO R4
-  WiFi.setTimeout(10000);
+  // Configurazione specifica per piattaforma
+  #ifdef ESP32
+    // Eventuali configurazioni specifiche per ESP32
+  #else
+    // Configurazioni specifiche per UNO R4
+    WiFi.setTimeout(10000);
+  #endif
+  
   mqttClient.setBufferSize(CBOR_BUFFER_SIZE);
   mqttClient.setCallback(mqttCallback);
   
-  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
 }
 
 void loop() {
@@ -71,22 +101,30 @@ void loop() {
   }
 
   safeDelay(100);
-  digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
 }
 
 // ******************** FUNZIONI WIFI/MQTT ***********************
 bool initWiFi() {
   Serial.println("\n[WiFi] Tentativo connessione...");
   
-  WiFi.end();
-  delay(1000);
+  #ifdef ESP32
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    delay(1000);
+  #else
+    WiFi.end();
+    delay(1000);
+  #endif
   
-  int status = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   
   for (int i = 0; i < 20; i++) {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("\n[WiFi] Connesso! RSSI: ");
       Serial.println(WiFi.RSSI());
+      Serial.print("IP: ");
+      Serial.println(WiFi.localIP());
       return true;
     }
     Serial.print(".");
@@ -125,8 +163,13 @@ void publishData() {
   
   cbor_encoder_init(&encoder, cborBuffer, sizeof(cborBuffer), 0);
   
-  // Crea mappa con 3 elementi
+  // Crea mappa con elementi (più per ESP32)
+  #ifdef ESP32
+  err = cbor_encoder_create_map(&encoder, &mapEncoder, 4);
+  #else
   err = cbor_encoder_create_map(&encoder, &mapEncoder, 3);
+  #endif
+  
   if(err != CborNoError) {
     Serial.println("Errore creazione mappa CBOR");
     return;
@@ -137,8 +180,17 @@ void publishData() {
   cbor_encode_uint(&mapEncoder, millis());
 
   // Valore analogico
+  #ifdef ESP32
+  cbor_encode_text_stringz(&mapEncoder, "a0");
+  cbor_encode_uint(&mapEncoder, analogRead(36)); // ADC1_CHANNEL_0 su ESP32
+  
+  // Aggiunta di un valore specifico per ESP32
+  cbor_encode_text_stringz(&mapEncoder, "hall");
+  cbor_encode_int(&mapEncoder, hallRead()); // Sensore effetto Hall (solo ESP32)
+  #else
   cbor_encode_text_stringz(&mapEncoder, "a0");
   cbor_encode_uint(&mapEncoder, analogRead(A0));
+  #endif
 
   // Memoria libera
   cbor_encode_text_stringz(&mapEncoder, "mem");
@@ -187,7 +239,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       if(strcmp(key, "led") == 0 && cbor_value_is_integer(&mapItem)) {
         int state;
         cbor_value_get_int(&mapItem, &state);
-        digitalWrite(LED_BUILTIN, state);
+        digitalWrite(LED_PIN, state);
         Serial.print("[LED] Impostato a: ");
         Serial.println(state);
       }
@@ -218,6 +270,10 @@ void safeDelay(unsigned long ms) {
 }
 
 int getFreeMemory() {
-  char top;
-  return &top - reinterpret_cast<char*>(malloc(1));
+  #ifdef ESP32
+    return ESP.getFreeHeap();
+  #else
+    char top;
+    return &top - reinterpret_cast<char*>(malloc(1));
+  #endif
 }
