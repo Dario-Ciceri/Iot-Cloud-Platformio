@@ -1,279 +1,328 @@
-#include <Arduino.h>
-#include <PubSubClient.h>
-#include <cbor.h>
+/*
+  OTA Firmware Updater semplificato per Arduino UNO R4 WiFi
+  
+  Scarica un firmware tramite HTTP e lo applica utilizzando InternalStorage
+  Supporta sia trasferimenti normali che chunked
+*/
 
-// Platform-specific includes
-#ifdef ESP32
-  #include <WiFi.h>
-  #define LED_PIN 2
-#else // Arduino UNO R4 WiFi
-  #include <WiFiS3.h>
-  #define LED_PIN LED_BUILTIN
-#endif
+#include <WiFiS3.h>
 
-// *********************** CONFIGURAZIONE ************************
-const char WIFI_SSID[] = "test";
-const char WIFI_PASSWORD[] = "12345678";
+#define NO_OTA_NETWORK
+#include <ArduinoOTA.h> // solo per InternalStorage
 
-const char MQTT_BROKER[] = "192.168.1.243";
-const int MQTT_PORT = 1883;
-const char MQTT_USER[] = "serverpod";
-const char MQTT_PASS[] = "serverpod";
+// Definizione versione
+const short VERSION = 10;
 
-// Platform-specific MQTT settings
-#ifdef ESP32
-  const char MQTT_CLIENT_ID[] = "esp32-device";
-  const char PUB_TOPIC[] = "esp32/loopback";
-  const char SUB_TOPIC[] = "esp32/commands";
-  const size_t CBOR_BUFFER_SIZE = 256;  // ESP32 ha più memoria
-#else
-  const char MQTT_CLIENT_ID[] = "arduino-uno-r4-wifi";
-  const char PUB_TOPIC[] = "arduino-uno-r4-wifi/loopback";
-  const char SUB_TOPIC[] = "arduino-uno-r4-wifi/commands";
-  const size_t CBOR_BUFFER_SIZE = 128;
-#endif
+// Configurazione WiFi
+const char* WIFI_SSID = "test";
+const char* WIFI_PASS = "12345678";
 
-const int PUB_INTERVAL = 5000;
-const int CONNECTION_RETRY = 15000;
-// ***************************************************************
+// Configurazione server
+const char* SERVER = "192.168.1.25";
+const int SERVER_PORT = 9003;
+const char* PATH = "/api/v1/download-shared-object/aHR0cDovLzEyNy4wLjAuMTo5MDAwL290YS9QbGF5QW5pbWF0aW9uLmluby5iaW4_WC1BbXotQWxnb3JpdGhtPUFXUzQtSE1BQy1TSEEyNTYmWC1BbXotQ3JlZGVudGlhbD0zSUJWOEkzWEJEMDlDRks0SFdSUSUyRjIwMjUwMzA2JTJGdXMtZWFzdC0xJTJGczMlMkZhd3M0X3JlcXVlc3QmWC1BbXotRGF0ZT0yMDI1MDMwNlQyMTMwMjBaJlgtQW16LUV4cGlyZXM9NDMyMDAmWC1BbXotU2VjdXJpdHktVG9rZW49ZXlKaGJHY2lPaUpJVXpVeE1pSXNJblI1Y0NJNklrcFhWQ0o5LmV5SmhZMk5sYzNOTFpYa2lPaUl6U1VKV09Fa3pXRUpFTURsRFJrczBTRmRTVVNJc0ltVjRjQ0k2TVRjME1UTXdOak0yTWl3aWNHRnlaVzUwSWpvaVlXUnRhVzRpZlEuTER3a2dqTy1QY0hCYXJQb3FIdW9UT3NxZnlsMlVkVHZtUjdPWVRiMWI3T1BEZHEyaEsyYnVOb2NWb21QZFBNQW4xUGw0ZWdqWkhpRUo3ZGczWUM4aHcmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnZlcnNpb25JZD1udWxsJlgtQW16LVNpZ25hdHVyZT05ZWY4NmQ1MTcwMzBiZTI4ODU2Yzc5MjcxOTY3MTlhNjJjY2ZlZjU5ODVmNDAzNWM0NmEyOTMyZjAxNmRjZDky";
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+// Configurazione OTA
+const unsigned long CHECK_INTERVAL = 30000;  // 30 secondi
+const int DOWNLOAD_TIMEOUT = 60000;          // 60 secondi
+const int MAX_FIRMWARE_SIZE = 128 * 1024;    // 128KB massimo
+const int BUFFER_SIZE = 1024;                // Buffer per lettura blocchi
 
-uint8_t cborBuffer[CBOR_BUFFER_SIZE];
-unsigned long lastPubTime = 0;
-unsigned long lastConnAttempt = 0;
-bool wifiConnected = false;
-bool mqttConnected = false;
+WiFiClient client;
 
-// Prototipi
-bool initWiFi();
-bool initMQTT();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void publishData();
-void checkConnections();
-void safeDelay(unsigned long ms);
-int getFreeMemory();
+// Buffer per lettura blocchi
+uint8_t buffer[BUFFER_SIZE];
+
+// Funzione per scaricare e applicare l'aggiornamento
+bool downloadAndUpdate() {
+  Serial.println("\n--- Avvio aggiornamento OTA ---");
+
+  // Connessione al server
+  Serial.print("Connessione a ");
+  Serial.println(SERVER);
+  
+  if (!client.connect(SERVER, SERVER_PORT)) {
+    Serial.println("Errore: connessione al server fallita");
+    return false;
+  }
+  
+  // Invio richiesta HTTP
+  Serial.print("Richiesta file: ");
+  Serial.println(PATH);
+  
+  client.print("GET ");
+  client.print(PATH);
+  client.println(" HTTP/1.1");
+  client.print("Host: ");
+  client.println(SERVER);
+  client.println("Connection: close");
+  client.println();
+  
+  // Attesa risposta
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 10000) {
+      Serial.println("Errore: timeout connessione");
+      client.stop();
+      return false;
+    }
+  }
+  
+  // Parsing headers HTTP
+  String line;
+  int statusCode = 0;
+  bool chunkedTransfer = false;
+  long contentLength = -1;
+  
+  while (client.connected()) {
+    line = client.readStringUntil('\n');
+    line.trim();
+    
+    if (line.startsWith("HTTP/")) {
+      statusCode = line.substring(9, 12).toInt();
+      Serial.print("Codice stato: ");
+      Serial.println(statusCode);
+    } else if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+      Serial.print("Dimensione file: ");
+      Serial.print(contentLength);
+      Serial.println(" bytes");
+    } else if (line.startsWith("Transfer-Encoding: chunked")) {
+      chunkedTransfer = true;
+      Serial.println("Trasferimento chunked");
+    }
+    
+    // Linea vuota indica fine degli headers
+    if (line.length() == 0) {
+      break;
+    }
+  }
+  
+  // Controllo errori
+  if (statusCode != 200) {
+    Serial.print("Errore: risposta HTTP ");
+    Serial.println(statusCode);
+    client.stop();
+    return false;
+  }
+  
+  // Se è un trasferimento chunked, dobbiamo prima determinare la dimensione
+  if (chunkedTransfer) {
+    // Possiamo stimare una dimensione massima o usare una dimensione fissa
+    contentLength = 64 * 1024; // 64KB come dimensione sicura di default
+    Serial.println("Trasferimento chunked, utilizzo dimensione fissa di 64KB");
+  }
+  
+  if (contentLength <= 0) {
+    Serial.println("Errore: dimensione file sconosciuta");
+    client.stop();
+    return false;
+  }
+  
+  // Apertura InternalStorage
+  Serial.print("Allocazione spazio: ");
+  Serial.print(contentLength);
+  Serial.println(" bytes");
+  
+  if (!InternalStorage.open(contentLength)) {
+    Serial.println("Errore: spazio insufficiente per l'aggiornamento");
+    client.stop();
+    return false;
+  }
+  
+  // Download e scrittura del firmware
+  Serial.println("Download in corso...");
+  
+  unsigned long bytesWritten = 0;
+  unsigned long downloadStart = millis();
+  
+  if (chunkedTransfer) {
+    // Gestione trasferimento chunked
+    while (client.connected()) {
+      // Leggi dimensione chunk
+      String chunkSizeStr = client.readStringUntil('\r');
+      client.read(); // Consuma \n
+      
+      // Converti da hex a int
+      int chunkSize = strtol(chunkSizeStr.c_str(), NULL, 16);
+      
+      if (chunkSize == 0) {
+        // Ultimo chunk
+        Serial.println("Fine trasferimento chunked");
+        client.readStringUntil('\r');
+        client.read(); // Consuma \n
+        break;
+      }
+      
+      // Scarica il chunk
+      int bytesRead = 0;
+      while (bytesRead < chunkSize && client.connected()) {
+        if (!client.available()) {
+          if (millis() - downloadStart > DOWNLOAD_TIMEOUT) {
+            Serial.println("Errore: timeout download");
+            InternalStorage.close();
+            client.stop();
+            return false;
+          }
+          delay(1);
+          continue;
+        }
+        
+        // Leggi in blocchi
+        int toRead = min(min(BUFFER_SIZE, chunkSize - bytesRead), client.available());
+        int actualRead = client.read(buffer, toRead);
+        
+        if (actualRead > 0) {
+          // Scrivi in InternalStorage
+          for (int i = 0; i < actualRead; i++) {
+            InternalStorage.write(buffer[i]);
+          }
+          
+          bytesRead += actualRead;
+          bytesWritten += actualRead;
+          
+          // Mostra progresso
+          if (bytesWritten % 4096 == 0) {
+            Serial.print("Download: ");
+            Serial.print(bytesWritten);
+            Serial.println(" bytes");
+          }
+        }
+      }
+      
+      // Leggi CRLF alla fine del chunk
+      client.readStringUntil('\r');
+      client.read(); // Consuma \n
+    }
+  } else {
+    // Download normale con Content-Length
+    while (bytesWritten < contentLength && client.connected()) {
+      if (!client.available()) {
+        if (millis() - downloadStart > DOWNLOAD_TIMEOUT) {
+          Serial.println("Errore: timeout download");
+          InternalStorage.close();
+          client.stop();
+          return false;
+        }
+        delay(1);
+        continue;
+      }
+      
+      // Leggi in blocchi
+      int toRead = min(min(BUFFER_SIZE, contentLength - bytesWritten), client.available());
+      int actualRead = client.read(buffer, toRead);
+      
+      if (actualRead > 0) {
+        // Scrivi in InternalStorage
+        for (int i = 0; i < actualRead; i++) {
+          InternalStorage.write(buffer[i]);
+        }
+        
+        bytesWritten += actualRead;
+        
+        // Mostra progresso
+        if (bytesWritten % 4096 == 0) {
+          Serial.print("Download: ");
+          Serial.print(bytesWritten);
+          Serial.print(" di ");
+          Serial.print(contentLength);
+          Serial.println(" bytes");
+        }
+      }
+    }
+  }
+  
+  // Chiudi connessione e InternalStorage
+  client.stop();
+  InternalStorage.close();
+  
+  // Verifica download
+  if ((chunkedTransfer && bytesWritten > 0) || (bytesWritten == contentLength)) {
+    Serial.print("Download completato: ");
+    Serial.print(bytesWritten);
+    Serial.println(" bytes");
+    
+    // Applica aggiornamento
+    Serial.println("Applicazione aggiornamento e riavvio...");
+    Serial.flush();
+    delay(1000);
+    
+    // Questa linea non ritorna se l'aggiornamento ha successo
+    InternalStorage.apply();
+    
+    // Se arriviamo qui, c'è stato un errore
+    Serial.println("Errore: applicazione aggiornamento fallita");
+    return false;
+  } else {
+    Serial.print("Errore: download incompleto. Ricevuti ");
+    Serial.print(bytesWritten);
+    if (!chunkedTransfer) {
+      Serial.print(" di ");
+      Serial.print(contentLength);
+    }
+    Serial.println(" bytes");
+    return false;
+  }
+}
 
 void setup() {
+  // Inizializza seriale
   Serial.begin(115200);
+  delay(3000); // Attendi inizializzazione seriale
   
-  #ifndef ESP32
-  // Solo per UNO R4: wait for serial port to connect
-  while (!Serial); // Rimuovere in produzione
-  #else
-  delay(1000); // ESP32: breve attesa senza bloccare
-  #endif
+  Serial.println("\n\n--- OTA Firmware Updater ---");
+  Serial.print("Versione: ");
+  Serial.println(VERSION);
   
-  Serial.print("\n[SYSTEM] Avvio ");
-  Serial.print(BOARD_NAME);
+  // Connessione WiFi
+  Serial.print("Connessione a ");
+  Serial.print(WIFI_SSID);
   Serial.println("...");
   
-  // Configurazione specifica per piattaforma
-  #ifdef ESP32
-    // Eventuali configurazioni specifiche per ESP32
-  #else
-    // Configurazioni specifiche per UNO R4
-    WiFi.setTimeout(10000);
-  #endif
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   
-  mqttClient.setBufferSize(CBOR_BUFFER_SIZE);
-  mqttClient.setCallback(mqttCallback);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
   
-  pinMode(LED_PIN, OUTPUT);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connesso!");
+    Serial.print("Indirizzo IP: ");
+    Serial.println(WiFi.localIP());
+    
+    // Esegui aggiornamento all'avvio
+    downloadAndUpdate();
+  } else {
+    Serial.println();
+    Serial.println("Errore: connessione WiFi fallita");
+  }
 }
 
 void loop() {
-  unsigned long now = millis();
-
-  if (!wifiConnected || (now - lastConnAttempt > CONNECTION_RETRY)) {
-    checkConnections();
-    lastConnAttempt = now;
-  }
-
-  if (mqttConnected) {
-    mqttClient.loop();
+  static unsigned long lastCheck = 0;
+  unsigned long currentTime = millis();
+  
+  // Controlla periodicamente aggiornamenti
+  if (currentTime - lastCheck >= CHECK_INTERVAL) {
+    lastCheck = currentTime;
     
-    if (now - lastPubTime >= PUB_INTERVAL) {
-      publishData();
-      lastPubTime = now;
+    // Riconnetti se necessario
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Riconnessione WiFi...");
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      delay(5000);
     }
-  }
-
-  safeDelay(100);
-  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-}
-
-// ******************** FUNZIONI WIFI/MQTT ***********************
-bool initWiFi() {
-  Serial.println("\n[WiFi] Tentativo connessione...");
-  
-  #ifdef ESP32
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_STA);
-    delay(1000);
-  #else
-    WiFi.end();
-    delay(1000);
-  #endif
-  
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  for (int i = 0; i < 20; i++) {
+    
+    // Verifica aggiornamenti
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("\n[WiFi] Connesso! RSSI: ");
-      Serial.println(WiFi.RSSI());
-      Serial.print("IP: ");
-      Serial.println(WiFi.localIP());
-      return true;
-    }
-    Serial.print(".");
-    safeDelay(500);
-  }
-  
-  Serial.println("\n[WiFi] ERRORE: Controllare credenziali o segnale");
-  return false;
-}
-
-bool initMQTT() {
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  
-  Serial.println("\n[MQTT] Connessione al broker...");
-  
-  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
-    Serial.println("[MQTT] Connesso!");
-    mqttClient.subscribe(SUB_TOPIC);
-    return true;
-  }
-  
-  Serial.print("[MQTT] Errore: ");
-  switch(mqttClient.state()) {
-    case -4: Serial.println("Timeout connessione"); break;
-    case -3: Serial.println("Connessione persa"); break;
-    case -2: Serial.println("Connessione fallita"); break;
-    case -1: Serial.println("Disconnesso"); break;
-    default: Serial.println("Sconosciuto");
-  }
-  return false;
-}
-
-void publishData() {
-  CborError err;
-  CborEncoder encoder, mapEncoder;
-  
-  cbor_encoder_init(&encoder, cborBuffer, sizeof(cborBuffer), 0);
-  
-  // Crea mappa con elementi (più per ESP32)
-  #ifdef ESP32
-  err = cbor_encoder_create_map(&encoder, &mapEncoder, 4);
-  #else
-  err = cbor_encoder_create_map(&encoder, &mapEncoder, 3);
-  #endif
-  
-  if(err != CborNoError) {
-    Serial.println("Errore creazione mappa CBOR");
-    return;
-  }
-
-  // Timestamp
-  cbor_encode_text_stringz(&mapEncoder, "ts");
-  cbor_encode_uint(&mapEncoder, millis());
-
-  // Valore analogico
-  #ifdef ESP32
-  cbor_encode_text_stringz(&mapEncoder, "a0");
-  cbor_encode_uint(&mapEncoder, analogRead(36)); // ADC1_CHANNEL_0 su ESP32
-  
-  // Aggiunta di un valore specifico per ESP32
-  cbor_encode_text_stringz(&mapEncoder, "hall");
-  cbor_encode_int(&mapEncoder, hallRead()); // Sensore effetto Hall (solo ESP32)
-  #else
-  cbor_encode_text_stringz(&mapEncoder, "a0");
-  cbor_encode_uint(&mapEncoder, analogRead(A0));
-  #endif
-
-  // Memoria libera
-  cbor_encode_text_stringz(&mapEncoder, "mem");
-  cbor_encode_uint(&mapEncoder, getFreeMemory());
-
-  cbor_encoder_close_container(&encoder, &mapEncoder);
-
-  size_t cborLen = cbor_encoder_get_buffer_size(&encoder, cborBuffer);
-  
-  if(mqttClient.publish(PUB_TOPIC, cborBuffer, cborLen)) {
-    Serial.print("[CBOR] Inviati ");
-    Serial.print(cborLen);
-    Serial.println(" bytes");
-  } else {
-    Serial.println("[CBOR] Errore trasmissione!");
-  }
-}
-
-// ******************** GESTIONE MESSAGGI *************************
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("\n[MQTT] Ricevuto: ");
-  Serial.println(topic);
-
-  CborParser parser;
-  CborValue value;
-  CborError err = cbor_parser_init(payload, length, 0, &parser, &value);
-  
-  if(err || !cbor_value_is_map(&value)) {
-    Serial.println("CBOR non valido");
-    return;
-  }
-
-  CborValue mapItem;
-  size_t mapSize;
-  cbor_value_get_map_length(&value, &mapSize);
-  cbor_value_enter_container(&value, &mapItem);
-
-  for(size_t i = 0; i < mapSize; ++i) {
-    if(cbor_value_is_text_string(&mapItem)) {
-      char key[16];
-      size_t keyLen = sizeof(key);
-      cbor_value_copy_text_string(&mapItem, key, &keyLen, NULL);
-      
-      cbor_value_advance(&mapItem);
-      
-      if(strcmp(key, "led") == 0 && cbor_value_is_integer(&mapItem)) {
-        int state;
-        cbor_value_get_int(&mapItem, &state);
-        digitalWrite(LED_PIN, state);
-        Serial.print("[LED] Impostato a: ");
-        Serial.println(state);
-      }
-      cbor_value_advance(&mapItem);
+      downloadAndUpdate();
     }
   }
-}
-
-// *********************** UTILITIES ******************************
-void checkConnections() {
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiConnected = false;
-    mqttConnected = false;
-    wifiConnected = initWiFi();
-  }
   
-  if (wifiConnected && !mqttClient.connected()) {
-    mqttConnected = initMQTT();
-  }
-}
-
-void safeDelay(unsigned long ms) {
-  unsigned long start = millis();
-  while (millis() - start < ms) {
-    delay(1);
-    if (mqttConnected) mqttClient.loop();
-  }
-}
-
-int getFreeMemory() {
-  #ifdef ESP32
-    return ESP.getFreeHeap();
-  #else
-    char top;
-    return &top - reinterpret_cast<char*>(malloc(1));
-  #endif
+  // Altro codice loop...
+  delay(100);
 }
