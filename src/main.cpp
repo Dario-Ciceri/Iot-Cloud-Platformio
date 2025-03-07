@@ -79,7 +79,7 @@ const char* PING_TOPIC = "ping/";                            // Prefisso per i m
 // OTA Settings
 const int DOWNLOAD_TIMEOUT = 60000;          // Timeout download (60 secondi)
 const size_t BUFFER_SIZE = 1024;             // Dimensione buffer lettura (1KB)
-const size_t CBOR_BUFFER_SIZE = 1536;        // Dimensione buffer CBOR - ridotta per risparmiare memoria
+const size_t CBOR_BUFFER_SIZE = 6000;        // Dimensione buffer CBOR - ridotta per risparmiare memoria
 
 // Time tracking
 unsigned long lastMqttReconnectAttempt = 0;
@@ -598,24 +598,28 @@ void parseUpdateCommand(byte* payload, unsigned int length) {
       }
       // Processa path se presente
       else if (strcmp(keyBuffer, "path") == 0 && cbor_value_is_text_string(&mapValue)) {
-        // Per path lunghe, gestiamo con particolare attenzione
-        // Prima controlliamo la lunghezza effettiva
+        // Per path lunghe, usa un approccio diverso
         size_t actualLength;
         cbor_value_calculate_string_length(&mapValue, &actualLength);
         
         serialDebugf("Path rilevata (lunghezza: %u bytes)", actualLength);
         
-        if (actualLength >= sizeof(updateParams.serverPath) - 1) {
-          serialDebugf("ATTENZIONE: Path è troppo lunga (%u bytes) e verrà troncata", actualLength);
-          publishDebug("ATTENZIONE: Path troppo lunga - possibile troncamento");
+        // Usa un buffer temporaneo più grande per la path
+        char* tempPath = (char*)malloc(actualLength + 1);
+        if (tempPath) {
+          size_t valueLength = actualLength;
+          cbor_value_copy_text_string(&mapValue, tempPath, &valueLength, &mapValue);
+          tempPath[valueLength] = '\0';
+          
+          // Copia solo quanto può entrare nel buffer di destinazione
+          strncpy(updateParams.serverPath, tempPath, sizeof(updateParams.serverPath)-1);
+          updateParams.serverPath[sizeof(updateParams.serverPath)-1] = '\0';
+          
+          free(tempPath);
+          hasPath = true;
+        } else {
+          serialDebug("Errore: memoria insufficiente per path");
         }
-        
-        size_t valueLength = sizeof(updateParams.serverPath) - 1;
-        cbor_value_copy_text_string(&mapValue, updateParams.serverPath, &valueLength, &mapValue);
-        updateParams.serverPath[valueLength] = '\0';  // Assicura terminazione stringa
-        
-        serialDebugf("Path: '%s'", updateParams.serverPath);
-        hasPath = true;
       }
       // Processa content_length se presente
       else if (strcmp(keyBuffer, "content_length") == 0 && cbor_value_is_integer(&mapValue)) {
