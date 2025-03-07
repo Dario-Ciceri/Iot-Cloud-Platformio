@@ -69,8 +69,8 @@ const char* WIFI_PASS = "12345678";
 
 // Configurazione server di aggiornamento
 const char* SERVER = "192.168.1.25";
-const int SERVER_PORT = 9003;
-const char* PATH = "/api/v1/download-shared-object/aHR0cDovLzEyNy4wLjAuMTo5MDAwL290YS9CbGluay5pbm8uYmluP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9M0lCVjhJM1hCRDA5Q0ZLNEhXUlElMkYyMDI1MDMwNiUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAzMDZUMjM0MDI4WiZYLUFtei1FeHBpcmVzPTQzMTk4JlgtQW16LVNlY3VyaXR5LVRva2VuPWV5SmhiR2NpT2lKSVV6VXhNaUlzSW5SNWNDSTZJa3BYVkNKOS5leUpoWTJObGMzTkxaWGtpT2lJelNVSldPRWt6V0VKRU1EbERSa3MwU0ZkU1VTSXNJbVY0Y0NJNk1UYzBNVE13TmpNMk1pd2ljR0Z5Wlc1MElqb2lZV1J0YVc0aWZRLkxEd2tnak8tUGNIQmFyUG9xSHVvVE9zcWZ5bDJVZFR2bVI3T1lUYjFiN09QRGRxMmhLMmJ1Tm9jVm9tUGRQTUFuMVBsNGVnalpIaUVKN2RnM1lDOGh3JlgtQW16LVNpZ25lZEhlYWRlcnM9aG9zdCZ2ZXJzaW9uSWQ9bnVsbCZYLUFtei1TaWduYXR1cmU9MDg3Zjk0YTA3MmQ1ZDI3NjcyNDEyOTg4NTg3YjU4YmVkNjE4NmQ0N2I2MGNlYTY3ZWYzMTFhNmYzMzNjNTk4OQ";
+const int SERVER_PORT = 8082;
+const char* PATH = "/s/s4QoUxkV";
 
 // Configurazione OTA
 const unsigned long CHECK_INTERVAL = 30000;  // Intervallo tra controlli aggiornamenti (30 secondi)
@@ -297,24 +297,27 @@ bool downloadAndUpdate() {
   while (client.connected()) {
     line = client.readStringUntil('\n');
     line.trim();
-    
+  
+    String lowerLine = line;
+    lowerLine.toLowerCase();
+  
     // Estrazione codice stato
-    if (line.startsWith("HTTP/")) {
+    if (lowerLine.startsWith("http/")) {
       statusCode = line.substring(9, 12).toInt();
       printDebugf("\nCodice stato: %d\n", statusCode);
     } 
-    // Estrazione Content-Length
-    else if (line.startsWith("Content-Length:")) {
+    // Estrazione Content-Length (case-insensitive)
+    else if (lowerLine.startsWith("content-length:")) {
+      // Puoi anche chiamare trim() per eliminare eventuali spazi
       contentLength = line.substring(15).toInt();
       printDebugf("Dimensione file: %ld bytes\n", contentLength);
     } 
     // Rilevamento trasferimento chunked
-    else if (line.startsWith("Transfer-Encoding: chunked")) {
+    else if (lowerLine.startsWith("transfer-encoding: chunked")) {
       chunkedTransfer = true;
       printDebug("Trasferimento chunked");
     }
     
-    // Linea vuota indica fine degli header
     if (line.length() == 0) {
       break;
     }
@@ -351,6 +354,7 @@ bool downloadAndUpdate() {
     printDebug("Errore: dimensione file sconosciuta");
     client.stop();
     return false;
+    //contentLength = 54200;
   }
   
   // Step 7: Apertura storage per il firmware
